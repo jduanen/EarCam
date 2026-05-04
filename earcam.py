@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""EarCam: Python client for Soulear ear inspection camera.
+"""EarCam: Python client for Soulear ear inspection camera
 
-Protocol reverse-engineered from ~/Code2/Suear-Web-Viewer (Sean Pesce).
 Camera acts as a WiFi Direct Group Owner / soft AP.
-Connect your machine to the "Soulear-830bb" open WiFi network first.
+Connect your machine to the "Soulear-*****" open WiFi network first.
+
+Got help with protocol reverse-engineering from ~/Code2/Suear-Web-Viewer (Sean Pesce).
 """
 
 import argparse

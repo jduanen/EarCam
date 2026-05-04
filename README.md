@@ -1,12 +1,14 @@
 # EarCam
 
-Python client for the **Soulear ear inspection camera** (Soulear-830bb). Replaces the proprietary Android app with a Linux command-line viewer that displays the live video stream in an OpenCV window and optionally saves frames to disk.
+**WIP** Video not working
+
+Python client for the **Soulear ear inspection camera**. Replaces the proprietary Android app with a Linux command-line viewer that displays the live video stream in an OpenCV window and optionally saves frames to disk.
 
 ## Hardware
 
 | Field | Value |
 |---|---|
-| Device | Soulear-830bb |
+| Device | Soulear-xxxxx |
 | Chipset | Taixin Semi TXW816-810 |
 | WiFi | 802.11b/g/n, 2.4 GHz, channel 7 |
 | Camera IP | 192.168.1.1 |
@@ -24,7 +26,7 @@ pip install -r requirements.txt
 
 ## Usage
 
-Connect your machine to the **Soulear-830bb** WiFi network first (open network, no password), then:
+Connect your machine to the **Soulear-xxxxx** WiFi network first (open network, no password), then:
 
 ```bash
 # Verify the camera responds and print device info
@@ -44,8 +46,8 @@ Example `--info` output:
 
 ```
 Querying device info...
-Device  : Soulear Soulear-830bb 1.0.0
-SSID    : Soulear-830bb
+Device  : Soulear Soulear-1dab0 1.0.0
+SSID    : Soulear-1dab0
 Battery : 85%
 ```
 
