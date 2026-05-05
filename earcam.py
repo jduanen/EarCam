@@ -22,7 +22,7 @@ import numpy as np
 CAMERA_IP = '192.168.1.1'
 CMD_PORT = 10005
 STREAM_INIT_PORT = 10006
-STREAM_RECV_PORT = 22785
+STREAM_RECV_PORT = 22789
 MAGIC = 0xffeeffee
 
 # Command header: magic(u32) id(u16) type(u16) unk(u8) err_code(u8) length(u16)

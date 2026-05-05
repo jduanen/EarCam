@@ -61,7 +61,7 @@ The camera uses a custom UDP protocol with magic bytes `0xffeeffee`.
 |---|---|---|
 | 10005 UDP | client → camera | Command/control (GetDeviceInfo, SetLed, etc.) |
 | 10006 UDP | client → camera | Stream init (OpenVideo command) |
-| 22785 UDP | camera → client | JPEG chunk stream |
+| 22789 UDP | camera → client | JPEG chunk stream |
 
 ### Command frame (12 bytes, little-endian)
 
