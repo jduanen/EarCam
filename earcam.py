@@ -8,6 +8,7 @@ Got help with protocol reverse-engineering from ~/Code2/Suear-Web-Viewer (Sean P
 """
 
 import argparse
+import math
 import os
 import queue
 import socket
@@ -57,7 +58,23 @@ def _parse_chunk_hdr(data: bytes) -> dict:
         'total_chunks': total_chunks,  # nonzero only on last chunk of a frame
         'res_width': res_w,
         'res_height': res_h,
+        'accel': _parse_accel(data[6:10]),
     }
+
+
+def _parse_accel(b: bytes) -> tuple[int, int, int]:
+    """Decode the accelerometer packed into chunk-header bytes 6-9.
+
+    Three 10-bit sign-magnitude fields (9-bit magnitude, then a sign bit), about 64 counts per g.
+    X and Y lie in the image plane; Z points along the lens.
+    """
+    v = int.from_bytes(b, 'little')
+
+    def axis(off: int) -> int:
+        mag = (v >> off) & 0x1ff
+        return -mag if (v >> (off + 9)) & 1 else mag
+
+    return axis(0), axis(10), axis(20)
 
 
 def _parse_device_info(data: bytes) -> dict:
@@ -97,13 +114,15 @@ class JpgFrame:
         self._first_chunk: int | None = None
         self.width = 0
         self.height = 0
+        self.accel = (0, 0, 0)
 
     def add_chunk(self, n_chunk: int, chunk_data: bytes, total_chunks: int,
-                  width: int = 0, height: int = 0):
+                  width: int = 0, height: int = 0, accel: tuple[int, int, int] = (0, 0, 0)):
         if self._first_chunk is None:
             self._first_chunk = n_chunk
             self.width = width
             self.height = height
+            self.accel = accel
         self.chunks[n_chunk] = bytes(chunk_data)
         if total_chunks:               # nonzero on the last chunk only
             self.total = total_chunks
@@ -207,7 +226,7 @@ class SoulearClient:
 
             frames[n_frame].add_chunk(
                 hdr['n_chunk'], chunk_data, hdr['total_chunks'],
-                hdr['res_width'], hdr['res_height'],
+                hdr['res_width'], hdr['res_height'], hdr['accel'],
             )
 
             if frames[n_frame].complete:
@@ -248,7 +267,8 @@ class SoulearClient:
         print('Opening video stream...')
         self.open_stream()
 
-        led_on, mirror = True, False
+        led_on, mirror, upright = True, False, True
+        roll = 0.0
         try:
             self.set_led(True)  # the Android app also turns the light on when it connects
         except OSError as e:
@@ -256,7 +276,7 @@ class SoulearClient:
 
         recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
         recv_thread.start()
-        print("Streaming — 'l' light on/off, 'm' mirror (left/right ear), 'q' quit")
+        print("Streaming — 'l' light on/off, 'm' mirror (left/right ear), 'u' keep upright, 'q' quit")
 
         frame_count = 0
         while True:
@@ -272,10 +292,17 @@ class SoulearClient:
             if img is None:
                 continue  # corrupted reassembly, skip
 
+            if upright:
+                x, y, _ = frame.accel
+                if math.hypot(x, y) >= 32:  # roll is undefined pointing straight up/down; keep last
+                    roll = math.degrees(math.atan2(x, y)) + 90  # sensor is mounted 90° from the image axes
+                h, w = img.shape[:2]
+                img = cv2.warpAffine(img, cv2.getRotationMatrix2D((w / 2, h / 2), roll, 1.0), (w, h))
             if mirror:
                 img = cv2.flip(img, 1)  # the app's left/right ear switch is a horizontal flip
             view = img.copy()
-            status = f'LED {"on" if led_on else "off"}  Mirror {"on" if mirror else "off"}'
+            status = (f'LED {"on" if led_on else "off"}  Mirror {"on" if mirror else "off"}'
+                      f'  Upright {"on" if upright else "off"}')
             cv2.putText(view, status, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             cv2.imshow('EarCam', view)
             if save_dir:
@@ -288,6 +315,8 @@ class SoulearClient:
                 break
             if key == ord('m'):
                 mirror = not mirror
+            if key == ord('u'):
+                upright = not upright
             if key == ord('l'):
                 try:
                     self.set_led(not led_on)
