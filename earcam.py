@@ -155,11 +155,21 @@ class SoulearClient:
         resp = self._send_cmd(0x0001)
         return _parse_device_info(resp['payload'])
 
+    def set_led(self, on: bool):
+        # Payloads captured from the Android app (traces/controlsTrace2.pcap)
+        payload = bytes([0x11, 0x01, 0x64]) if on else bytes([0x11, 0x00, 0x00])
+        resp = self._send_cmd(0x000a, payload)
+        if resp['err_code'] != 0:
+            raise IOError(f'SetLed command failed (err_code={resp["err_code"]})')
+
     def open_stream(self):
         init_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         init_sock.settimeout(self._SOCK_TIMEOUT)
         try:
-            resp = self._send_cmd(0x0004, port=STREAM_INIT_PORT, sock=init_sock)
+            # Payload = receive port + 2 zero bytes, as the Android app sends.
+            # Without it the camera may acknowledge but send no video.
+            resp = self._send_cmd(0x0004, struct.pack('<HH', STREAM_RECV_PORT, 0),
+                                  port=STREAM_INIT_PORT, sock=init_sock)
         finally:
             init_sock.close()
         if resp['err_code'] != 0:
@@ -238,9 +248,15 @@ class SoulearClient:
         print('Opening video stream...')
         self.open_stream()
 
+        led_on, mirror = True, False
+        try:
+            self.set_led(True)  # the Android app also turns the light on when it connects
+        except OSError as e:
+            print(f'Warning: could not turn on LED ({e})')
+
         recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
         recv_thread.start()
-        print("Streaming — press 'q' to quit")
+        print("Streaming — 'l' light on/off, 'm' mirror (left/right ear), 'q' quit")
 
         frame_count = 0
         while True:
@@ -256,14 +272,28 @@ class SoulearClient:
             if img is None:
                 continue  # corrupted reassembly, skip
 
-            cv2.imshow('EarCam', img)
+            if mirror:
+                img = cv2.flip(img, 1)  # the app's left/right ear switch is a horizontal flip
+            view = img.copy()
+            status = f'LED {"on" if led_on else "off"}  Mirror {"on" if mirror else "off"}'
+            cv2.putText(view, status, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.imshow('EarCam', view)
             if save_dir:
                 path = os.path.join(save_dir, f'frame_{frame_count:05d}.jpg')
                 cv2.imwrite(path, img)
             frame_count += 1
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 break
+            if key == ord('m'):
+                mirror = not mirror
+            if key == ord('l'):
+                try:
+                    self.set_led(not led_on)
+                    led_on = not led_on
+                except OSError as e:
+                    print(f'LED command failed: {e}')
 
         self._stop.set()
         if self._stream_sock:
