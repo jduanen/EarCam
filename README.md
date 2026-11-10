@@ -34,7 +34,7 @@ Connect your machine to the **Soulear-xxxxx** WiFi network first (open network, 
 # Verify the camera responds and print device info
 python earcam.py --info
 
-# Live video in an OpenCV window (press q to quit)
+# Live video in an OpenCV window
 python earcam.py
 
 # Live video + save every frame as a JPEG
@@ -43,6 +43,16 @@ python earcam.py --save ./frames
 # Non-default camera IP
 python earcam.py --camera 192.168.1.1
 ```
+
+Keys in the video window:
+
+| Key | Action |
+|---|---|
+| `l` | Turn the camera light on/off (the light is turned on when streaming starts, as the Android app does) |
+| `m` | Mirror the image horizontally; this is what the app's left ear/right ear switch does |
+| `q` | Quit |
+
+The current light and mirror state is shown in the top-left corner of the window. Saved frames include the mirroring but not the status text.
 
 Example `--info` output:
 
@@ -121,13 +131,13 @@ Discovered by probing with `probe.py`. err=2 = invalid/wrong port; err=255 = not
 | 0x0001 | 10005 | client→cam | GetDeviceInfo | none | 128-byte device info struct | See layout below |
 | 0x0002 | 10005 | client→cam | ? | none | 180 zero bytes | Purpose unknown |
 | 0x0003 | 10005 | client→cam | — | none | none | err=255 (not implemented) |
-| 0x0004 | 10006 | client→cam | OpenVideo | none | none | err=2 if sent to port 10005 |
+| 0x0004 | 10006 | client→cam | OpenVideo | none, or u16 port + 2 zero bytes | none | err=2 if sent to port 10005. The payload is the client's receive port (the app sends e.g. `9d 9f 00 00` = 40861; earcam.py sends 22789). With no payload the camera acknowledges, but after the app had used it, it sent no video |
 | 0x0005 | 10005 | client→cam | — | none | none | err=2 |
 | 0x0006 | 10005 | client→cam | ? | none | 2 bytes (0x0004) | Possibly GetResolution or GetMode |
 | 0x0007 | 10005 | client→cam | ? | none | none | Returns ok; purpose unknown |
 | 0x0008 | 10005 | client→cam | PowerOff? | none | none | **DANGEROUS**: any non-empty payload powers off camera |
 | 0x0009 | 10007 | cam→client | Heartbeat | — | 17 bytes | Camera pushes every ~2 s; not request/response |
-| 0x000a | 10005 | client→cam | SetLed | ? | — | Timed out with empty, 0x00, and 0x01; payload format unknown |
+| 0x000a | 10005 | client→cam | SetLed | on: `11 01 64`, off: `11 00 00` | echo of the request | From an Android app capture; the app sends "on" when it connects. Shorter payloads time out |
 | 0x000b–0x001f | 10005 | client→cam | — | — | — | No response to empty or single-byte payloads |
 
 ### GetDeviceInfo response payload (128 bytes, offsets from payload start)
@@ -159,9 +169,8 @@ Offset  Size  Field         Notes
 3       1     last_chunk    0x01 on the final chunk of a frame
 4       1     total_chunks  total chunk count for this frame; present on all chunks, not just the last
 5       1     unk5
-6       2     pos_x         possibly accelerometer/orientation data
-8       2     pos_y
-10      2     pos_z
+6       4     orientation   changes as the camera rotates; encoding not yet decoded (see below)
+10      2     mac_tail      last two bytes of the camera's MAC address (85 b4 for 48:78:86:0f:85:b4); constant
 12      2     res_width     frame width in pixels
 14      2     res_height    frame height in pixels
 16      …     JPEG data     partial JPEG; reassemble all chunks to get one JPEG image
@@ -181,6 +190,20 @@ Offset  Size  Field         Notes
 - Both `n_chunk` and `n_frame` are 8-bit and roll over at 256. Chunk ordering within a frame uses `(n_chunk - first_chunk_seen) % 256`.
 - `total_chunks` is set to the frame's total chunk count on **every** chunk (not just the last). Frame completion is detected when the number of received chunks equals `total_chunks`.
 - `last_chunk` is `0x01` only on the final chunk of a frame; it is redundant with `total_chunks` but useful as a fast boundary check.
+
+### Orientation bytes (offsets 6–9, partly understood)
+
+Observed in a capture while rotating the camera through a full turn:
+
+- Byte 6 sits near 64 when the camera is held level and falls smoothly to 0 halfway through the turn, then climbs back; it looks like a tilt value.
+- Byte 7 wraps through its full 0–255 range during the turn, and the low bit of byte 8 changes when byte 7 wraps.
+- Bit 5 of byte 9 flips at the halfway point.
+
+A simple accelerometer layout (two or three packed axes) does not fit the data, so the exact mapping to a rotation angle is still unknown.
+
+### Left/right ear and image rotation in the Android app
+
+Switching between left and right ear sends no command to the camera; the app mirrors the image itself. Keeping the image upright also sends no command, so the app rotates the image itself, presumably using the orientation bytes above.
 
 ## Files
 
