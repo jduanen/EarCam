@@ -1,5 +1,11 @@
 #!/bin/bash
 #
-# Refresh the venv
+# Refresh the venv (e.g. after a system Python upgrade breaks it).
+# Afterwards, activate it in your shell with: source venv/bin/activate
 
-cd ~/Code/EarCam && rm -rf venv && python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+rm -rf venv
+python3 -m venv venv
+venv/bin/pip install -r requirements.txt
