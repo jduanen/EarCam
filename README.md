@@ -50,9 +50,10 @@ Keys in the video window:
 |---|---|
 | `l` | Turn the camera light on/off (the light is turned on when streaming starts, as the Android app does) |
 | `m` | Mirror the image horizontally; this is what the app's left ear/right ear switch does |
+| `u` | Keep the image upright as the camera rotates, using the camera's accelerometer (on by default) |
 | `q` | Quit |
 
-The current light and mirror state is shown in the top-left corner of the window. Saved frames include the mirroring but not the status text.
+The current light, mirror and upright state is shown in the top-left corner of the window. Saved frames include the mirroring and rotation but not the status text. When the camera points straight up or down, the rotation stays at its last value.
 
 Example `--info` output:
 
@@ -62,6 +63,20 @@ Device  : Soulear Soulear-1dab0 1.0.0
 SSID    : Soulear-1dab0
 Battery : 85%
 ```
+
+## Helper scripts (`bin/`)
+
+These run from any directory. They use the Wi-Fi interface `wlp0s20f3` unless you set `WIFI_DEV`, e.g. `WIFI_DEV=wlan0 bin/connectWifi.sh`.
+
+| Script | Purpose |
+|---|---|
+| `connectWifi.sh [SSID]` | Connect to the camera. With no SSID, it picks the first visible `Soulear-*` network |
+| `monitorWifi.sh [channel]` | Put the Wi-Fi into monitor mode on a channel (default 4) to sniff the Android app's traffic. This takes the machine off Wi-Fi |
+| `captureWifi.sh [file.pcap]` | Record everything on that channel (default `traces/capture_<date>_<time>.pcap`); stop with Ctrl-C. Needs monitor mode, and never overwrites an existing file |
+| `resetWifi.sh` | Put the Wi-Fi back into normal mode after a capture |
+| `refreshVenv.sh` | Rebuild `venv` from scratch, e.g. after a system Python upgrade breaks it. Activate it afterwards with `source venv/bin/activate` |
+
+Because the camera's network is open, monitor mode sees the phone's traffic in plain text. A typical capture is `monitorWifi.sh`, then `captureWifi.sh` while using the app, then `resetWifi.sh` and `connectWifi.sh`.
 
 ## Protocol exploration
 
@@ -169,7 +184,7 @@ Offset  Size  Field         Notes
 3       1     last_chunk    0x01 on the final chunk of a frame
 4       1     total_chunks  total chunk count for this frame; present on all chunks, not just the last
 5       1     unk5
-6       4     orientation   changes as the camera rotates; encoding not yet decoded (see below)
+6       4     accel         3-axis accelerometer (see below)
 10      2     mac_tail      last two bytes of the camera's MAC address (85 b4 for 48:78:86:0f:85:b4); constant
 12      2     res_width     frame width in pixels
 14      2     res_height    frame height in pixels
@@ -191,19 +206,26 @@ Offset  Size  Field         Notes
 - `total_chunks` is set to the frame's total chunk count on **every** chunk (not just the last). Frame completion is detected when the number of received chunks equals `total_chunks`.
 - `last_chunk` is `0x01` only on the final chunk of a frame; it is redundant with `total_chunks` but useful as a fast boundary check.
 
-### Orientation bytes (offsets 6–9, partly understood)
+### Accelerometer (chunk header offsets 6–9)
 
-Observed in a capture while rotating the camera through a full turn:
+Read the 4 bytes as a little-endian u32. It holds three 10-bit **sign-magnitude** fields (a 9-bit magnitude followed by a sign bit), at about 64 counts per g:
 
-- Byte 6 sits near 64 when the camera is held level and falls smoothly to 0 halfway through the turn, then climbs back; it looks like a tilt value.
-- Byte 7 wraps through its full 0–255 range during the turn, and the low bit of byte 8 changes when byte 7 wraps.
-- Bit 5 of byte 9 flips at the halfway point.
+```
+Bits    Field
+0–8     X magnitude   (image plane)
+9       X sign        (1 = negative)
+10–18   Y magnitude   (image plane)
+19      Y sign
+20–28   Z magnitude   (along the lens: +64 pointing straight up, −64 straight down)
+29      Z sign
+30–31   unused (0)
+```
 
-A simple accelerometer layout (two or three packed axes) does not fit the data, so the exact mapping to a rotation angle is still unknown.
+The camera's roll is `atan2(X, Y)`. The scene in the image turns by the same angle, so rotating the image counter-clockwise by `atan2(X, Y) + 90°` (in degrees, as with `cv2.getRotationMatrix2D`) keeps it upright. The 90° offset reflects how the sensor is mounted relative to the image and was set by checking the live picture. This was decoded from a capture of a full turn plus a guided test at known angles. Across about 8,000 chunks the magnitude averaged 65 (1 g).
 
-### Left/right ear and image rotation in the Android app
+### Left/right ear and keeping upright in the Android app
 
-Switching between left and right ear sends no command to the camera; the app mirrors the image itself. Keeping the image upright also sends no command, so the app rotates the image itself, presumably using the orientation bytes above.
+Neither sends a command to the camera. The app mirrors the image itself for left/right ear, and rotates it itself to keep it upright.
 
 ## Files
 
@@ -211,6 +233,7 @@ Switching between left and right ear sends no command to the camera; the app mir
 earcam.py        Main client — connect, stream, display
 probe.py         Command probe/write tool for reverse-engineering the protocol
 requirements.txt opencv-python, numpy
+bin/             Wi-Fi, capture and venv helper scripts (see above)
 ```
 
 ## Troubleshooting
