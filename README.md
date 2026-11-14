@@ -53,7 +53,9 @@ Keys in the video window:
 | `u` | Keep the image upright as the camera rotates, using the camera's accelerometer (on by default) |
 | `q` | Quit |
 
-The current light, mirror and upright state is shown in the top-left corner of the window. Saved frames include the mirroring and rotation but not the status text. When the camera points straight up or down, the rotation stays at its last value.
+The frame rate and current light, mirror and upright state are shown in the top-left corner of the window. Saved frames include the mirroring and rotation but not the status text. When the camera points straight up or down, the rotation stays at its last value.
+
+If no valid frame arrives for 0.75 seconds, the window marks the image **NO LIVE VIDEO** rather than presenting a frozen image as live. The window and quit controls remain responsive while waiting for video. Every five seconds, the terminal reports the frame rate and cumulative counts of incomplete frames, JPEG decode errors, and older queued frames replaced by newer ones.
 
 Example `--info` output:
 
@@ -194,16 +196,17 @@ Offset  Size  Field         Notes
 ### Connection sequence
 
 1. Client sends **GetDeviceInfo** (type `0x0001`) to port 10005 → camera responds with device metadata
-2. Client sends **OpenVideo** (type `0x0004`) to port 10006 → camera starts streaming
-3. Client binds UDP port 22789 and receives JPEG chunk packets
+2. Client binds UDP port 22789 with an increased receive buffer
+3. Client sends **OpenVideo** (type `0x0004`) to port 10006 → camera starts streaming to the already-listening socket
 4. Camera begins pushing **Heartbeat** (type `0x0009`) to client port 10007 every ~2 s
 5. Chunks with the same `n_frame` are reassembled into a complete JPEG and displayed
 
 ### Frame reassembly notes
 
 - `n_chunk` is a **global** monotonically increasing counter — it does not reset to 0 at the start of each frame. Frame boundaries come from `n_frame` changing.
-- Both `n_chunk` and `n_frame` are 8-bit and roll over at 256. Chunk ordering within a frame uses `(n_chunk - first_chunk_seen) % 256`.
-- `total_chunks` is set to the frame's total chunk count on **every** chunk (not just the last). Frame completion is detected when the number of received chunks equals `total_chunks`.
+- Both `n_chunk` and `n_frame` are 8-bit and roll over at 256. The chunk starting with the JPEG SOI marker (`ff d8`) anchors the order, so packets can arrive out of order, including across rollover.
+- `total_chunks` is set to the frame's total chunk count on **every** chunk (not just the last). A frame is complete only when all expected consecutive chunk IDs have arrived. Duplicate packets do not count twice.
+- Partial frames expire after 0.5 seconds. The display queue retains only the newest completed frame to avoid accumulating playback latency.
 - `last_chunk` is `0x01` only on the final chunk of a frame; it is redundant with `total_chunks` but useful as a fast boundary check.
 
 ### Accelerometer (chunk header offsets 6–9)
@@ -231,6 +234,7 @@ Neither sends a command to the camera. The app mirrors the image itself for left
 
 ```
 earcam.py        Main client — connect, stream, display
+test_earcam.py   Offline streaming and GUI regression tests
 probe.py         Command probe/write tool for reverse-engineering the protocol
 requirements.txt opencv-python, numpy
 bin/             Wi-Fi, capture and venv helper scripts (see above)
@@ -240,6 +244,16 @@ bin/             Wi-Fi, capture and venv helper scripts (see above)
 
 **`ERROR: No response from camera`** — confirm you are connected to the Soulear WiFi and that your IP is in the 192.168.1.x range (`ip addr`).
 
-**`Waiting for frames...`** — the OpenVideo handshake succeeded but no chunks are arriving. Check that nothing else (e.g., the phone app) is connected to the camera at the same time; the camera may only stream to one client.
+**`NO LIVE VIDEO`** — no valid frame has arrived recently. Check the camera is on, the WiFi is connected, and nothing else (e.g., the phone app) is using the camera; it may only stream to one client.
 
 **Corrupted or missing frames** — the camera sends on channel 7; nearby interference can cause packet loss. Move closer to the camera.
+
+## Tests
+
+With the dependencies installed, run:
+
+```bash
+python -m unittest -v test_earcam
+```
+
+Tests use synthetic JPEGs and mocked sockets and GUI calls; no camera, WiFi connection, or display server is required.
