@@ -14,6 +14,7 @@ import queue
 import socket
 import struct
 import threading
+import time
 from collections import deque
 
 import cv2
@@ -55,7 +56,7 @@ def _parse_chunk_hdr(data: bytes) -> dict:
     return {
         'n_chunk': n_chunk,
         'n_frame': n_frame,
-        'total_chunks': total_chunks,  # nonzero only on last chunk of a frame
+        'total_chunks': total_chunks,
         'res_width': res_w,
         'res_height': res_h,
         'accel': _parse_accel(data[6:10]),
@@ -83,10 +84,10 @@ def _parse_device_info(data: bytes) -> dict:
     # 81: ssid(32) 113: unk32(4) 117: unk16(2) 119: power_info(2) 121: capacity(1)
     if len(data) < 122:
         return {}
-    vendor = data[1:33].rstrip(b'\x00').decode('ascii', errors='replace')
-    product_id = data[33:65].rstrip(b'\x00').decode('ascii', errors='replace')
-    fw_version = data[65:81].rstrip(b'\x00').decode('ascii', errors='replace')
-    ssid = data[81:113].rstrip(b'\x00').decode('ascii', errors='replace')
+    vendor = data[1:33].split(b'\x00', 1)[0].decode('ascii', errors='replace')
+    product_id = data[33:65].split(b'\x00', 1)[0].decode('ascii', errors='replace')
+    fw_version = data[65:81].split(b'\x00', 1)[0].decode('ascii', errors='replace')
+    ssid = data[81:113].split(b'\x00', 1)[0].decode('ascii', errors='replace')
     power_info = struct.unpack_from('<H', data, 119)[0]
     capacity = data[121]
     return {
@@ -103,8 +104,8 @@ def _parse_device_info(data: bytes) -> dict:
 class JpgFrame:
     """Reassembles a single JPEG frame from UDP chunks.
 
-    Fixes vs. Suear-Web-Viewer: no fixed-size buffer (avoids overflow for large frames),
-    and chunk ordering uses modular arithmetic to handle 8-bit index rollover correctly.
+    Anchor chunk ordering at the JPEG start, not the first packet to arrive.
+    Wi-Fi can deliver packets out of order, including across the 8-bit rollover.
     """
 
     def __init__(self, n_frame: int):
@@ -112,38 +113,42 @@ class JpgFrame:
         self.chunks: dict[int, bytes] = {}
         self.total: int | None = None
         self._first_chunk: int | None = None
+        self.created_at = time.monotonic()
         self.width = 0
         self.height = 0
         self.accel = (0, 0, 0)
 
     def add_chunk(self, n_chunk: int, chunk_data: bytes, total_chunks: int,
                   width: int = 0, height: int = 0, accel: tuple[int, int, int] = (0, 0, 0)):
-        if self._first_chunk is None:
+        if chunk_data.startswith(b'\xff\xd8'):
             self._first_chunk = n_chunk
+        if not self.chunks:
             self.width = width
             self.height = height
             self.accel = accel
         self.chunks[n_chunk] = bytes(chunk_data)
-        if total_chunks:               # nonzero on the last chunk only
+        if total_chunks:
             self.total = total_chunks
 
     @property
     def complete(self) -> bool:
-        return self.total is not None and len(self.chunks) == self.total
+        if self.total is None or self._first_chunk is None or len(self.chunks) != self.total:
+            return False
+        return all((self._first_chunk + i) % 256 in self.chunks for i in range(self.total))
 
     @property
     def data(self) -> bytes:
-        if not self.chunks or self._first_chunk is None:
+        if not self.complete:
             return b''
         first = self._first_chunk
-        ordered = sorted(self.chunks, key=lambda i: (i - first) % 256)
-        return b''.join(self.chunks[i] for i in ordered)
+        return b''.join(self.chunks[(first + i) % 256] for i in range(self.total))
 
 
 class SoulearClient:
     _MAX_FRAME_SLOTS = 8
+    _MAX_FRAME_AGE = 0.5
     _SOCK_TIMEOUT = 5.0
-    _FRAME_QUEUE_SZ = 4
+    _FRAME_QUEUE_SZ = 1
 
     def __init__(self, camera_ip: str = CAMERA_IP):
         self.camera_ip = camera_ip
@@ -152,6 +157,8 @@ class SoulearClient:
         self._stream_sock: socket.socket | None = None
         self._frame_queue: queue.Queue[JpgFrame] = queue.Queue(maxsize=self._FRAME_QUEUE_SZ)
         self._stop = threading.Event()
+        self.stats = {'packets': 0, 'frames': 0, 'incomplete': 0, 'queue_drops': 0,
+                      'decode_errors': 0}
 
     def _next_id(self) -> int:
         self._msg_id = (self._msg_id + 1) & 0xffff
@@ -182,19 +189,40 @@ class SoulearClient:
             raise IOError(f'SetLed command failed (err_code={resp["err_code"]})')
 
     def open_stream(self):
-        init_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        init_sock.settimeout(self._SOCK_TIMEOUT)
+        # Listen before asking the camera to send; otherwise the first frame can
+        # already be in flight when the socket is finally bound.
+        stream_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            # Payload = receive port + 2 zero bytes, as the Android app sends.
-            # Without it the camera may acknowledge but send no video.
-            resp = self._send_cmd(0x0004, struct.pack('<HH', STREAM_RECV_PORT, 0),
-                                  port=STREAM_INIT_PORT, sock=init_sock)
-        finally:
-            init_sock.close()
-        if resp['err_code'] != 0:
-            raise IOError(f'OpenVideo command failed (err_code={resp["err_code"]})')
-        self._stream_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._stream_sock.bind(('0.0.0.0', STREAM_RECV_PORT))
+            stream_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            stream_sock.settimeout(0.2)
+            stream_sock.bind(('0.0.0.0', STREAM_RECV_PORT))
+            init_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                init_sock.settimeout(self._SOCK_TIMEOUT)
+                # Payload = receive port + 2 zero bytes, as the Android app sends.
+                # Without it the camera may acknowledge but send no video.
+                resp = self._send_cmd(0x0004, struct.pack('<HH', STREAM_RECV_PORT, 0),
+                                      port=STREAM_INIT_PORT, sock=init_sock)
+                if resp['err_code'] != 0:
+                    raise IOError(f'OpenVideo command failed (err_code={resp["err_code"]})')
+            finally:
+                init_sock.close()
+        except BaseException:
+            stream_sock.close()
+            raise
+        self._stream_sock = stream_sock
+
+    def _publish_frame(self, frame: JpgFrame):
+        # Prefer current video over a backlog of older images.
+        try:
+            self._frame_queue.put_nowait(frame)
+        except queue.Full:
+            try:
+                self._frame_queue.get_nowait()
+                self.stats['queue_drops'] += 1
+            except queue.Empty:
+                pass
+            self._frame_queue.put_nowait(frame)
 
     def _recv_loop(self):
         frames: dict[int, JpgFrame] = {}
@@ -202,25 +230,32 @@ class SoulearClient:
 
         while not self._stop.is_set():
             try:
-                self._stream_sock.settimeout(1.0)
-                data, _ = self._stream_sock.recvfrom(CHUNK_HDR_SZ + 1500)
+                data, peer = self._stream_sock.recvfrom(65535)
             except socket.timeout:
                 continue
             except OSError:
                 break
 
-            if len(data) < CHUNK_HDR_SZ:
+            if peer[0] != self.camera_ip or len(data) <= CHUNK_HDR_SZ:
                 continue
+            self.stats['packets'] += 1
 
             hdr = _parse_chunk_hdr(data)
             chunk_data = data[CHUNK_HDR_SZ:]
             n_frame = hdr['n_frame']
+
+            # Expire partial frames before their 8-bit IDs can be reused.
+            now = time.monotonic()
+            while arrival and now - frames[arrival[0]].created_at > self._MAX_FRAME_AGE:
+                frames.pop(arrival.popleft())
+                self.stats['incomplete'] += 1
 
             if n_frame not in frames:
                 # Evict oldest incomplete frame if slots are full
                 if len(frames) >= self._MAX_FRAME_SLOTS:
                     old = arrival.popleft()
                     frames.pop(old, None)
+                    self.stats['incomplete'] += 1
                 frames[n_frame] = JpgFrame(n_frame)
                 arrival.append(n_frame)
 
@@ -235,17 +270,15 @@ class SoulearClient:
                     arrival.remove(n_frame)
                 except ValueError:
                     pass
-                try:
-                    self._frame_queue.put_nowait(frame)
-                except queue.Full:
-                    pass  # drop; display loop is behind
+                self.stats['frames'] += 1
+                self._publish_frame(frame)
 
     def run(self, save_dir: str | None = None, info_only: bool = False):
         print('Querying device info...')
         try:
             info = self.get_device_info()
         except socket.timeout:
-            print('ERROR: No response from camera. Are you connected to the Soulear-830bb WiFi?')
+            print('ERROR: No response from camera. Is it on and connected over Wi-Fi?')
             return
 
         vendor = info.get('vendor', '?')
@@ -259,6 +292,7 @@ class SoulearClient:
         print(f'Battery : {batt}%{charging}')
 
         if info_only:
+            self._cmd_sock.close()
             return
 
         if save_dir:
@@ -279,62 +313,92 @@ class SoulearClient:
         print("Streaming — 'l' light on/off, 'm' mirror (left/right ear), 'u' keep upright, 'q' quit")
 
         frame_count = 0
-        while True:
-            try:
-                frame = self._frame_queue.get(timeout=3.0)
-            except queue.Empty:
-                print('Waiting for frames... (is the phone app / another client disconnected?)')
-                continue
-
-            jpg = frame.data
-            arr = np.frombuffer(jpg, dtype=np.uint8)
-            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if img is None:
-                continue  # corrupted reassembly, skip
-
-            if upright:
-                x, y, _ = frame.accel
-                if math.hypot(x, y) >= 32:  # roll is undefined pointing straight up/down; keep last
-                    roll = math.degrees(math.atan2(x, y)) + 90  # sensor is mounted 90° from the image axes
-                h, w = img.shape[:2]
-                img = cv2.warpAffine(img, cv2.getRotationMatrix2D((w / 2, h / 2), roll, 1.0), (w, h))
-            if mirror:
-                img = cv2.flip(img, 1)  # the app's left/right ear switch is a horizontal flip
-            view = img.copy()
-            status = (f'LED {"on" if led_on else "off"}  Mirror {"on" if mirror else "off"}'
-                      f'  Upright {"on" if upright else "off"}')
-            cv2.putText(view, status, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            cv2.imshow('EarCam', view)
-            if save_dir:
-                path = os.path.join(save_dir, f'frame_{frame_count:05d}.jpg')
-                cv2.imwrite(path, img)
-            frame_count += 1
-
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            if key == ord('m'):
-                mirror = not mirror
-            if key == ord('u'):
-                upright = not upright
-            if key == ord('l'):
+        img, frame = None, None
+        last_frame_at = 0.0
+        stats_at = time.monotonic()
+        stats_frames = 0
+        fps = 0.0
+        try:
+            cv2.namedWindow('EarCam', cv2.WINDOW_NORMAL)
+            while True:
+                new_frame = False
                 try:
-                    self.set_led(not led_on)
-                    led_on = not led_on
-                except OSError as e:
-                    print(f'LED command failed: {e}')
+                    incoming = self._frame_queue.get(timeout=0.02)
+                except queue.Empty:
+                    incoming = None
+                if incoming is not None:
+                    decoded = cv2.imdecode(np.frombuffer(incoming.data, dtype=np.uint8),
+                                           cv2.IMREAD_COLOR)
+                    if decoded is not None:
+                        img, frame = decoded, incoming
+                        last_frame_at = time.monotonic()
+                        frame_count += 1
+                        new_frame = True
+                    else:
+                        self.stats['decode_errors'] += 1
 
-        self._stop.set()
-        if self._stream_sock:
-            self._stream_sock.close()
-        cv2.destroyAllWindows()
+                now = time.monotonic()
+                if now - stats_at >= 5.0:
+                    fps = (frame_count - stats_frames) / (now - stats_at)
+                    print(f'Video: {fps:.1f} fps; incomplete={self.stats["incomplete"]}, '
+                          f'decode_errors={self.stats["decode_errors"]}, '
+                          f'queue_drops={self.stats["queue_drops"]}')
+                    stats_at, stats_frames = now, frame_count
+
+                view = img.copy() if img is not None else np.zeros((480, 640, 3), np.uint8)
+                if frame is not None:
+                    if upright:
+                        x, y, _ = frame.accel
+                        if math.hypot(x, y) >= 32:
+                            roll = math.degrees(math.atan2(x, y)) + 90
+                        h, w = view.shape[:2]
+                        view = cv2.warpAffine(view, cv2.getRotationMatrix2D(
+                            (w / 2, h / 2), roll, 1.0), (w, h))
+                    if mirror:
+                        view = cv2.flip(view, 1)
+                    if save_dir and new_frame:
+                        path = os.path.join(save_dir, f'frame_{frame_count - 1:05d}.jpg')
+                        cv2.imwrite(path, view)
+
+                status = (f'{fps:.1f} fps  LED {"on" if led_on else "off"}'
+                          f'  Mirror {"on" if mirror else "off"}'
+                          f'  Upright {"on" if upright else "off"}')
+                cv2.putText(view, status, (8, 24), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5, (0, 255, 255), 1)
+                if now - last_frame_at > 0.75:
+                    cv2.putText(view, 'NO LIVE VIDEO - check camera / Wi-Fi', (8, 54),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                cv2.imshow('EarCam', view)
+
+                # Pump GUI events even if packets stop arriving or a JPEG is bad.
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q') or cv2.getWindowProperty('EarCam', cv2.WND_PROP_VISIBLE) < 1:
+                    break
+                if key == ord('m'):
+                    mirror = not mirror
+                if key == ord('u'):
+                    upright = not upright
+                if key == ord('l'):
+                    try:
+                        self.set_led(not led_on)
+                        led_on = not led_on
+                    except OSError as e:
+                        print(f'LED command failed: {e}')
+        finally:
+            self._stop.set()
+            if self._stream_sock:
+                self._stream_sock.close()
+            if self._cmd_sock:
+                self._cmd_sock.close()
+            recv_thread.join(timeout=1.0)
+            cv2.destroyAllWindows()
         print(f'Done — {frame_count} frames displayed.')
 
 
 def main():
     ap = argparse.ArgumentParser(
         description='EarCam: live viewer for Soulear ear inspection camera',
-        epilog='Connect to the Soulear-830bb open WiFi network before running.',
+        epilog='Connect to the camera\'s Soulear WiFi network before running.',
     )
     ap.add_argument('--camera', default=CAMERA_IP, metavar='IP',
                     help=f'Camera IP address (default: {CAMERA_IP})')
